@@ -25,6 +25,7 @@
     <module>properties</module>
     <module>yaml</module>
     <module>toml</module>
+    <module>sfv</module>
   </modules>
 
   <url>https://github.com/FasterXML/jackson-dataformats-text</url>
