@@ -1,0 +1,3 @@
+[submodule "sfv/src/test/resources/structured-field-tests"]
+	path = sfv/src/test/resources/structured-field-tests
+	url = https://github.com/httpwg/structured-field-tests

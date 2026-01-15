@@ -35,3 +35,9 @@ SfvFactory factory = SfvFactory.builder()
 ObjectMapper mapper = new ObjectMapper(factory);
 JsonNode dict = mapper.readTree("a=1, b=?0");
 ```
+
+## Tests
+
+The optional HTTPWG structured-field-tests JSON files can be placed under
+`sfv/src/test/resources/structured-field-tests/`. If present, the
+`SfvStructuredFieldTests` JUnit test will load and validate them.
