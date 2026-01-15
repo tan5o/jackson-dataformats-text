@@ -51,6 +51,7 @@ public class SfvStructuredFieldTests {
 
     private void runCase(String resource, ObjectNode entry, ObjectMapper jsonMapper) throws Exception {
         boolean mustFail = entry.path("must_fail").asBoolean(false);
+        String name = entry.path("name").isTextual() ? entry.path("name").textValue() : "<unnamed>";
         JsonNode rawNode = entry.get("raw");
         ArrayNode raws = (rawNode != null && rawNode.isArray()) ? (ArrayNode) rawNode : null;
         JsonNode expected = entry.get("expected");
@@ -61,15 +62,14 @@ public class SfvStructuredFieldTests {
         ObjectMapper mapper = new ObjectMapper(factory);
 
         if (raws != null) {
-            for (JsonNode rawValue : raws) {
-                String raw = rawValue.textValue();
-                if (mustFail) {
-                    assertThrows(Exception.class, () -> mapper.readTree(raw));
-                } else {
-                    JsonNode actual = mapper.readTree(raw);
-                    if (expected != null) {
-                        assertEquals(expected, actual);
-                    }
+            String raw = joinRawValues(raws);
+            if (mustFail) {
+                assertThrows(Exception.class, () -> mapper.readTree(raw),
+                        () -> resource + " :: " + name + " :: " + raw);
+            } else {
+                JsonNode actual = mapper.readTree(raw);
+                if (expected != null) {
+                    assertEquals(expected, actual, () -> resource + " :: " + name + " :: " + raw);
                 }
             }
         }
@@ -106,6 +106,17 @@ public class SfvStructuredFieldTests {
 
     private InputStream resourceStream(String resource) {
         return Thread.currentThread().getContextClassLoader().getResourceAsStream(resource);
+    }
+
+    private String joinRawValues(ArrayNode raws) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < raws.size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(raws.get(i).textValue());
+        }
+        return sb.toString();
     }
 
     private List<String> listResources(String folder) throws IOException {

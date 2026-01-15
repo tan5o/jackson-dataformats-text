@@ -1,8 +1,9 @@
 package tools.jackson.dataformat.sfv;
 
 import java.math.BigDecimal;
+import java.util.Base64;
 
-import tools.jackson.core.StreamWriteException;
+import tools.jackson.core.exc.StreamWriteException;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
@@ -189,8 +190,9 @@ final class SfvCodec {
         }
         if ("binary".equals(type)) {
             String value = valueNode.textValue();
-            validateBinary(value);
-            out.append(':').append(value).append(':');
+            byte[] bytes = decodeBase32(value);
+            String base64 = Base64.getEncoder().encodeToString(bytes);
+            out.append(':').append(base64).append(':');
             return;
         }
         if ("date".equals(type)) {
@@ -290,16 +292,68 @@ final class SfvCodec {
         }
     }
 
-    private static void validateBinary(String value) {
+    static String binaryToJsonValue(String base64Value) {
+        byte[] bytes;
+        try {
+            bytes = Base64.getDecoder().decode(base64Value);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid binary content");
+        }
+        return encodeBase32(bytes);
+    }
+
+    private static byte[] decodeBase32(String value) {
         if (value == null) {
             throw new IllegalArgumentException("Binary value cannot be null");
         }
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            if (!isBase32Char(c)) {
+        String normalized = value.trim();
+        int buffer = 0;
+        int bitsLeft = 0;
+        byte[] out = new byte[(normalized.length() * 5) / 8 + 1];
+        int outPos = 0;
+        for (int i = 0; i < normalized.length(); i++) {
+            char c = normalized.charAt(i);
+            if (c == '=') {
+                break;
+            }
+            int val = base32Value(c);
+            if (val < 0) {
                 throw new IllegalArgumentException("Invalid binary content");
             }
+            buffer = (buffer << 5) | val;
+            bitsLeft += 5;
+            if (bitsLeft >= 8) {
+                bitsLeft -= 8;
+                out[outPos++] = (byte) ((buffer >> bitsLeft) & 0xFF);
+            }
         }
+        byte[] result = new byte[outPos];
+        System.arraycopy(out, 0, result, 0, outPos);
+        return result;
+    }
+
+    private static String encodeBase32(byte[] data) {
+        final char[] alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".toCharArray();
+        StringBuilder sb = new StringBuilder((data.length * 8 + 4) / 5);
+        int buffer = 0;
+        int bitsLeft = 0;
+        for (byte b : data) {
+            buffer = (buffer << 8) | (b & 0xFF);
+            bitsLeft += 8;
+            while (bitsLeft >= 5) {
+                int index = (buffer >> (bitsLeft - 5)) & 0x1F;
+                bitsLeft -= 5;
+                sb.append(alphabet[index]);
+            }
+        }
+        if (bitsLeft > 0) {
+            int index = (buffer << (5 - bitsLeft)) & 0x1F;
+            sb.append(alphabet[index]);
+        }
+        while (sb.length() % 8 != 0) {
+            sb.append('=');
+        }
+        return sb.toString();
     }
 
     private static boolean isLowerAlpha(char c) {
@@ -315,8 +369,16 @@ final class SfvCodec {
                 || c == '_' || c == '-' || c == '.' || c == '*' || c == '/';
     }
 
-    private static boolean isBase32Char(char c) {
-        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
-                || (c >= '2' && c <= '7') || c == '=';
+    private static int base32Value(char c) {
+        if (c >= 'A' && c <= 'Z') {
+            return c - 'A';
+        }
+        if (c >= 'a' && c <= 'z') {
+            return c - 'a';
+        }
+        if (c >= '2' && c <= '7') {
+            return c - '2' + 26;
+        }
+        return -1;
     }
 }

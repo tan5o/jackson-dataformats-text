@@ -1,11 +1,12 @@
 package tools.jackson.dataformat.sfv;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 
 import tools.jackson.core.*;
 import tools.jackson.core.base.TextualTSFactory;
+import tools.jackson.core.exc.JacksonIOException;
 import tools.jackson.core.io.IOContext;
-import tools.jackson.core.io.UTF8Reader;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.TreeTraversingParser;
 
@@ -124,22 +125,34 @@ public final class SfvFactory extends TextualTSFactory {
     @Override
     protected JsonParser _createParser(ObjectReadContext readCtxt, IOContext ctxt, InputStream in) throws JacksonException {
         boolean autoClose = ctxt.isResourceManaged() || isEnabled(StreamReadFeature.AUTO_CLOSE_SOURCE);
-        return _createParser(readCtxt, ctxt, UTF8Reader.construct(ctxt, in, autoClose));
+        Reader reader = new InputStreamReader(in, StandardCharsets.UTF_8);
+        return _createParser(readCtxt, ctxt, autoClose ? new BufferedReader(reader) : reader);
     }
 
     @Override
     protected JsonParser _createParser(ObjectReadContext readCtxt, IOContext ctxt, Reader r) throws JacksonException {
+        boolean autoClose = ctxt.isResourceManaged() || isEnabled(StreamReadFeature.AUTO_CLOSE_SOURCE);
         try {
             JsonNode node = SfvParser.parse(readCtxt, ctxt, _formatReadFeatures, _defaultType, r);
             return new TreeTraversingParser(node, readCtxt);
+        } catch (IOException e) {
+            throw JacksonIOException.construct(e, r);
         } finally {
+            if (autoClose) {
+                try {
+                    r.close();
+                } catch (IOException e) {
+                    throw JacksonIOException.construct(e, r);
+                }
+            }
             ctxt.close();
         }
     }
 
     @Override
     protected JsonParser _createParser(ObjectReadContext readCtxt, IOContext ctxt, byte[] data, int offset, int len) throws JacksonException {
-        return _createParser(readCtxt, ctxt, UTF8Reader.construct(data, offset, len));
+        return _createParser(readCtxt, ctxt,
+                new InputStreamReader(new ByteArrayInputStream(data, offset, len), StandardCharsets.UTF_8));
     }
 
     @Override
@@ -153,22 +166,19 @@ public final class SfvFactory extends TextualTSFactory {
     }
 
     @Override
-    protected JsonGenerator _createGenerator(ObjectWriteContext writeCtxt, IOContext ctxt, OutputStream out) throws JacksonException {
-        int streamWriteFeatures = writeCtxt.getStreamWriteFeatures(_streamWriteFeatures);
-        int formatWriteFeatures = writeCtxt.getFormatWriteFeatures(_formatWriteFeatures);
-        return new SfvGenerator(ctxt, streamWriteFeatures, formatWriteFeatures, writeCtxt.getCodec(), out, _defaultType);
-    }
-
-    @Override
     protected JsonGenerator _createGenerator(ObjectWriteContext writeCtxt, IOContext ctxt, Writer out) throws JacksonException {
         int streamWriteFeatures = writeCtxt.getStreamWriteFeatures(_streamWriteFeatures);
         int formatWriteFeatures = writeCtxt.getFormatWriteFeatures(_formatWriteFeatures);
-        return new SfvGenerator(ctxt, streamWriteFeatures, formatWriteFeatures, writeCtxt.getCodec(), out, _defaultType);
+        return new SfvGenerator(writeCtxt, ctxt, streamWriteFeatures, formatWriteFeatures, out, _defaultType);
     }
 
     @Override
     protected JsonGenerator _createUTF8Generator(ObjectWriteContext writeCtxt, IOContext ctxt, OutputStream out) throws JacksonException {
-        return _createGenerator(writeCtxt, ctxt, _createWriter(ctxt, out, JsonEncoding.UTF8));
+        return new SfvGenerator(writeCtxt, ctxt,
+                writeCtxt.getStreamWriteFeatures(_streamWriteFeatures),
+                writeCtxt.getFormatWriteFeatures(_formatWriteFeatures),
+                _createWriter(ctxt, out, JsonEncoding.UTF8),
+                _defaultType);
     }
 
     @Override

@@ -2,8 +2,10 @@ package tools.jackson.dataformat.sfv;
 
 import java.io.IOException;
 import java.io.Reader;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
-import tools.jackson.core.JsonParseException;
+import tools.jackson.core.exc.StreamReadException;
 import tools.jackson.core.ObjectReadContext;
 import tools.jackson.core.io.IOContext;
 import tools.jackson.databind.JsonNode;
@@ -14,7 +16,7 @@ import tools.jackson.databind.node.ObjectNode;
 class SfvParser {
     private static final int MAX_CHARS_TO_REPORT = 1000;
 
-    public static JsonNode parse(ObjectReadContext readCtxt, IOContext ioContext, int formatReadFeatures,
+        public static JsonNode parse(ObjectReadContext readCtxt, IOContext ioContext, int formatReadFeatures,
             SfvType type, Reader reader) throws IOException {
         String input = readAll(reader);
         try {
@@ -34,6 +36,9 @@ class SfvParser {
                 throw new IllegalArgumentException("Unsupported SFV type: " + type);
             }
             parser.skipOWS();
+            if (parser.peek('\t')) {
+                throw parser.error("Invalid whitespace");
+            }
             if (!parser.isEof()) {
                 throw parser.error("Trailing data");
             }
@@ -47,7 +52,7 @@ class SfvParser {
             if (snippet.length() > MAX_CHARS_TO_REPORT) {
                 snippet = snippet.substring(0, MAX_CHARS_TO_REPORT) + "...";
             }
-            throw new JsonParseException(readCtxt, msg + " in input: " + snippet, e);
+            throw new StreamReadException((tools.jackson.core.JsonParser) null, msg + " in input: " + snippet, e);
         }
     }
 
@@ -83,31 +88,37 @@ class SfvParser {
         }
 
         JsonNode parseDictionary() {
-            ArrayNode result = JsonNodeFactory.instance.arrayNode();
+            Map<String, JsonNode> members = new LinkedHashMap<>();
             skipOWS();
+            if (peek('\t')) {
+                throw error("Invalid whitespace");
+            }
             if (isEof()) {
-                return result;
+                return JsonNodeFactory.instance.arrayNode();
             }
             while (true) {
-                ArrayNode entry = JsonNodeFactory.instance.arrayNode();
                 String key = parseKey();
-                entry.add(key);
-                skipOWS();
                 if (peek('=') ) {
                     next();
+                    if (peek(' ') || peek('\t')) {
+                        throw error("Unexpected whitespace after '='");
+                    }
                     ListElement value = parseListElement();
-                    entry.add(value.node);
-                } else {
+                    members.put(key, value.node);
+                } else if (peek(';') || peek(',') || isEof()) {
                     ArrayNode item = JsonNodeFactory.instance.arrayNode();
                     item.add(JsonNodeFactory.instance.booleanNode(true));
                     item.add(parseParameters());
-                    entry.add(item);
+                    members.put(key, item);
+                } else if (peek(' ') || peek('\t')) {
+                    throw error("Unexpected whitespace before '='");
+                } else {
+                    throw error("Invalid dictionary member");
                 }
-                result.add(entry);
-                skipOWS();
+                skipOWSWithTabs();
                 if (peek(',')) {
                     next();
-                    skipOWS();
+                    skipOWSWithTabs();
                     if (isEof()) {
                         throw error("Trailing comma");
                     }
@@ -115,22 +126,32 @@ class SfvParser {
                 }
                 break;
             }
+            ArrayNode result = JsonNodeFactory.instance.arrayNode();
+            for (Map.Entry<String, JsonNode> entry : members.entrySet()) {
+                ArrayNode pair = JsonNodeFactory.instance.arrayNode();
+                pair.add(entry.getKey());
+                pair.add(entry.getValue());
+                result.add(pair);
+            }
             return result;
         }
 
         JsonNode parseList() {
             ArrayNode result = JsonNodeFactory.instance.arrayNode();
             skipOWS();
+            if (peek('\t')) {
+                throw error("Invalid whitespace");
+            }
             if (isEof()) {
                 return result;
             }
             while (true) {
                 ListElement element = parseListElement();
                 result.add(element.node);
-                skipOWS();
+                skipOWSWithTabs();
                 if (peek(',')) {
                     next();
-                    skipOWS();
+                    skipOWSWithTabs();
                     if (isEof()) {
                         throw error("Trailing comma");
                     }
@@ -142,6 +163,10 @@ class SfvParser {
         }
 
         JsonNode parseItem() {
+            skipOWS();
+            if (peek('\t')) {
+                throw error("Invalid whitespace");
+            }
             ArrayNode result = JsonNodeFactory.instance.arrayNode();
             result.add(parseBareItem());
             result.add(parseParameters());
@@ -149,7 +174,6 @@ class SfvParser {
         }
 
         private ListElement parseListElement() {
-            skipOWS();
             if (peek('(')) {
                 return new ListElement(parseInnerList());
             }
@@ -163,7 +187,6 @@ class SfvParser {
             if (!peek(')')) {
                 while (true) {
                     items.add(parseItem());
-                    skipOWS();
                     if (peek(')')) {
                         break;
                     }
@@ -201,7 +224,6 @@ class SfvParser {
         }
 
         private JsonNode parseBareItem() {
-            skipOWS();
             if (peek('"')) {
                 return JsonNodeFactory.instance.textNode(parseString());
             }
@@ -292,7 +314,11 @@ class SfvParser {
             if (decimal) {
                 return JsonNodeFactory.instance.numberNode(new java.math.BigDecimal(raw));
             }
-            return JsonNodeFactory.instance.numberNode(Long.parseLong(raw));
+            long value = Long.parseLong(raw);
+            if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) {
+                return JsonNodeFactory.instance.numberNode((int) value);
+            }
+            return JsonNodeFactory.instance.numberNode(value);
         }
 
         private JsonNode parseToken() {
@@ -308,15 +334,21 @@ class SfvParser {
             int start = pos;
             while (!isEof() && peek() != ':') {
                 char c = next();
-                if (!isBase32Char(c)) {
+                if (!isBase64Char(c)) {
                     throw error("Invalid binary content");
                 }
             }
             expect(':');
             String value = input.substring(start, pos - 1);
+            String base32;
+            try {
+                base32 = SfvCodec.binaryToJsonValue(value);
+            } catch (IllegalArgumentException e) {
+                throw error("Invalid binary content");
+            }
             ObjectNode obj = JsonNodeFactory.instance.objectNode();
             obj.put(TYPE_FIELD, "binary");
-            obj.put(VALUE_FIELD, value);
+            obj.put(VALUE_FIELD, base32);
             return obj;
         }
 
@@ -386,8 +418,19 @@ class SfvParser {
         }
 
         void skipOWS() {
-            while (!isEof() && (peek() == ' ' || peek() == '\t')) {
+            while (!isEof() && peek() == ' ') {
                 pos++;
+            }
+        }
+
+        void skipOWSWithTabs() {
+            while (!isEof()) {
+                char c = peek();
+                if (c == ' ' || c == '\t') {
+                    pos++;
+                    continue;
+                }
+                break;
             }
         }
 
@@ -450,9 +493,9 @@ class SfvParser {
             return isAlpha(c) || isDigit(c) || c == '_' || c == '-' || c == '.' || c == '*' || c == '/';
         }
 
-        private static boolean isBase32Char(char c) {
+        private static boolean isBase64Char(char c) {
             return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
-                    || (c >= '2' && c <= '7') || c == '=';
+                    || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
         }
     }
 
