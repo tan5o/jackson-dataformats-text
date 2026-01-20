@@ -182,18 +182,27 @@ class SfvParser {
 
         private JsonNode parseInnerList() {
             expect('(');
+            // Skip optional leading SP after '('
             skipOWS();
             ArrayNode items = JsonNodeFactory.instance.arrayNode();
+            // Check if there's content before ')'
             if (!peek(')')) {
-                while (true) {
-                    items.add(parseItem());
+                // Parse first item
+                items.add(parseItem());
+                // Loop: while there are spaces, parse more items
+                while (!isEof()) {
+                    // Check for spaces before next item or before ')'
+                    if (!peek(' ')) {
+                        break; // No space, must be ')' or invalid
+                    }
+                    // Consume all spaces
+                    consumeSpaces();
+                    // After spaces, if ')', we're done (trailing spaces allowed)
                     if (peek(')')) {
                         break;
                     }
-                    if (!peek(' ')) {
-                        throw error("Expected space between inner list items");
-                    }
-                    consumeSpaces();
+                    // Parse next item
+                    items.add(parseItem());
                 }
             }
             expect(')');
@@ -204,9 +213,12 @@ class SfvParser {
         }
 
         private ArrayNode parseParameters() {
-            ArrayNode params = JsonNodeFactory.instance.arrayNode();
+            // Use LinkedHashMap to maintain order and handle duplicate keys (last value wins)
+            java.util.LinkedHashMap<String, JsonNode> paramsMap = new java.util.LinkedHashMap<>();
             while (peek(';')) {
                 next();
+                // RFC 9651: skip SP characters (but not Tab) after semicolon
+                skipOWS();
                 String key = parseKey();
                 JsonNode value;
                 if (peek('=')) {
@@ -215,9 +227,13 @@ class SfvParser {
                 } else {
                     value = JsonNodeFactory.instance.booleanNode(true);
                 }
+                paramsMap.put(key, value);
+            }
+            ArrayNode params = JsonNodeFactory.instance.arrayNode();
+            for (java.util.Map.Entry<String, JsonNode> e : paramsMap.entrySet()) {
                 ArrayNode entry = JsonNodeFactory.instance.arrayNode();
-                entry.add(key);
-                entry.add(value);
+                entry.add(e.getKey());
+                entry.add(e.getValue());
                 params.add(entry);
             }
             return params;
@@ -288,16 +304,22 @@ class SfvParser {
 
         private JsonNode parseNumber() {
             int start = pos;
+            boolean negative = false;
             if (peek('-')) {
+                negative = true;
                 next();
             }
             if (!isDigit(peek())) {
                 throw error("Invalid number");
             }
+            int intStart = pos;
             while (!isEof() && isDigit(peek())) {
                 next();
             }
+            int intLen = pos - intStart;
+            
             boolean decimal = false;
+            int fracLen = 0;
             if (peek('.')) {
                 decimal = true;
                 next();
@@ -305,16 +327,42 @@ class SfvParser {
                 while (!isEof() && isDigit(peek())) {
                     next();
                 }
-                int fracLen = pos - fracStart;
+                fracLen = pos - fracStart;
                 if (fracLen == 0 || fracLen > 3) {
                     throw error("Invalid decimal fraction");
                 }
+                // RFC 9651: decimal integer part max 12 digits
+                if (intLen > 12) {
+                    throw error("Decimal integer part exceeds 12 digits");
+                }
+            } else {
+                // RFC 9651: integer max 15 digits
+                if (intLen > 15) {
+                    throw error("Integer exceeds 15 digits");
+                }
             }
+            
             String raw = input.substring(start, pos);
             if (decimal) {
-                return JsonNodeFactory.instance.numberNode(new java.math.BigDecimal(raw));
+                // Normalize decimal by stripping trailing zeros for comparison with test JSON
+                java.math.BigDecimal bd = new java.math.BigDecimal(raw).stripTrailingZeros();
+                // Use double for values that fit to match JSON test file expectations
+                double d = bd.doubleValue();
+                if (new java.math.BigDecimal(d).compareTo(bd) == 0) {
+                    return JsonNodeFactory.instance.numberNode(d);
+                }
+                return JsonNodeFactory.instance.numberNode(bd);
             }
-            long value = Long.parseLong(raw);
+            long value;
+            try {
+                value = Long.parseLong(raw);
+            } catch (NumberFormatException e) {
+                throw error("Invalid integer value");
+            }
+            // RFC 9651: integer range check
+            if (value < -999_999_999_999_999L || value > 999_999_999_999_999L) {
+                throw error("Integer out of range");
+            }
             if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) {
                 return JsonNodeFactory.instance.numberNode((int) value);
             }
@@ -355,23 +403,148 @@ class SfvParser {
         private JsonNode parseDisplayString() {
             expect('%');
             expect('"');
-            String value = parseQuotedString('%');
+            String value = parseDisplayStringContent();
             ObjectNode obj = JsonNodeFactory.instance.objectNode();
             obj.put(TYPE_FIELD, "displaystring");
             obj.put(VALUE_FIELD, value);
             return obj;
         }
 
-        private String parseString() {
-            expect('"');
-            return parseQuotedString('"');
+        private String parseDisplayStringContent() {
+            // RFC 9651: display-string = "%" DQUOTE *(byte-or-pct) DQUOTE
+            // byte-or-pct = %x20-24 / "%25" / %x26-5B / "\\" / "\\\"" / %x5D-7E / pct-encoded
+            // pct-encoded = "%" LCHEXDIG LCHEXDIG
+            // Note: %25 is percent itself
+            // Note: Per httpwg test suite, backslash is also allowed as a literal character
+            java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+            while (!isEof()) {
+                char c = peek();
+                if (c == '"') {
+                    next();
+                    byte[] raw = bytes.toByteArray();
+                    // Validate UTF-8
+                    if (!isValidUtf8(raw)) {
+                        throw error("Invalid UTF-8 sequence in display string");
+                    }
+                    try {
+                        return new String(raw, "UTF-8");
+                    } catch (java.io.UnsupportedEncodingException e) {
+                        throw error("Invalid UTF-8 in display string");
+                    }
+                }
+                if (c == '\\') {
+                    next();
+                    if (!isEof()) {
+                        char esc = peek();
+                        if (esc == '"' || esc == '\\') {
+                            // Valid escape sequence
+                            next();
+                            bytes.write(esc);
+                            continue;
+                        }
+                    }
+                    // Backslash not followed by " or \ - treat as literal backslash
+                    bytes.write('\\');
+                    continue;
+                }
+                if (c == '%') {
+                    next();
+                    // Percent-encoding: %XX where XX is lowercase hex
+                    if (isEof() || !isLowerHex(peek())) {
+                        throw error("Invalid percent-encoding in display string");
+                    }
+                    char h1 = next();
+                    if (isEof() || !isLowerHex(peek())) {
+                        throw error("Invalid percent-encoding in display string");
+                    }
+                    char h2 = next();
+                    int byteVal = (hexValue(h1) << 4) | hexValue(h2);
+                    bytes.write(byteVal);
+                    continue;
+                }
+                // Valid printable ASCII except " and %
+                // Note: Backslash is handled above, so we exclude it here to avoid double processing
+                if (c >= 0x20 && c <= 0x7E && c != '"' && c != '%' && c != '\\') {
+                    next();
+                    bytes.write(c);
+                    continue;
+                }
+                throw error("Invalid character in display string");
+            }
+            throw error("Unterminated display string");
         }
 
-        private String parseQuotedString(char terminator) {
+        /**
+         * Validate UTF-8 byte sequence according to RFC 3629.
+         */
+        private static boolean isValidUtf8(byte[] bytes) {
+            int i = 0;
+            while (i < bytes.length) {
+                int b = bytes[i] & 0xFF;
+                if (b <= 0x7F) {
+                    // ASCII - single byte
+                    i++;
+                } else if ((b & 0xE0) == 0xC0) {
+                    // 2-byte sequence: 110xxxxx 10xxxxxx
+                    if (b < 0xC2) return false; // Overlong encoding
+                    if (i + 1 >= bytes.length) return false;
+                    int b2 = bytes[i + 1] & 0xFF;
+                    if ((b2 & 0xC0) != 0x80) return false;
+                    i += 2;
+                } else if ((b & 0xF0) == 0xE0) {
+                    // 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx
+                    if (i + 2 >= bytes.length) return false;
+                    int b2 = bytes[i + 1] & 0xFF;
+                    int b3 = bytes[i + 2] & 0xFF;
+                    if ((b2 & 0xC0) != 0x80) return false;
+                    if ((b3 & 0xC0) != 0x80) return false;
+                    // Check for overlong encoding
+                    if (b == 0xE0 && b2 < 0xA0) return false;
+                    // Check for surrogates (U+D800-U+DFFF)
+                    if (b == 0xED && b2 >= 0xA0) return false;
+                    i += 3;
+                } else if ((b & 0xF8) == 0xF0) {
+                    // 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+                    if (b > 0xF4) return false; // Beyond U+10FFFF
+                    if (i + 3 >= bytes.length) return false;
+                    int b2 = bytes[i + 1] & 0xFF;
+                    int b3 = bytes[i + 2] & 0xFF;
+                    int b4 = bytes[i + 3] & 0xFF;
+                    if ((b2 & 0xC0) != 0x80) return false;
+                    if ((b3 & 0xC0) != 0x80) return false;
+                    if ((b4 & 0xC0) != 0x80) return false;
+                    // Check for overlong encoding
+                    if (b == 0xF0 && b2 < 0x90) return false;
+                    // Check for values beyond U+10FFFF
+                    if (b == 0xF4 && b2 > 0x8F) return false;
+                    i += 4;
+                } else {
+                    // Invalid start byte
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static boolean isLowerHex(char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }
+
+        private static int hexValue(char c) {
+            if (c >= '0' && c <= '9') return c - '0';
+            return c - 'a' + 10;
+        }
+
+        private String parseString() {
+            expect('"');
+            return parseQuotedString();
+        }
+
+        private String parseQuotedString() {
             StringBuilder sb = new StringBuilder();
             while (!isEof()) {
                 char c = next();
-                if (c == terminator) {
+                if (c == '"') {
                     return sb.toString();
                 }
                 if (c == '\\') {
@@ -385,7 +558,7 @@ class SfvParser {
                     sb.append(esc);
                     continue;
                 }
-                if (c < 0x20 || c == 0x7F) {
+                if (c < 0x20 || c > 0x7E) {
                     throw error("Invalid character in string");
                 }
                 sb.append(c);
@@ -396,8 +569,10 @@ class SfvParser {
         private String parseTokenString() {
             int start = pos;
             char ch = next();
-            if (!isTokenChar(ch)) {
-                throw error("Invalid token");
+            // RFC 9651: token = ( ALPHA / "*" ) *( tchar / ":" / "/" )
+            // Token must START with ALPHA or *
+            if (!isAlpha(ch) && ch != '*') {
+                throw error("Invalid token start character");
             }
             while (!isEof() && isTokenChar(peek())) {
                 next();
@@ -482,7 +657,8 @@ class SfvParser {
         }
 
         private static boolean isKeyStart(char c) {
-            return (c >= 'a' && c <= 'z');
+            // RFC 9651: key = ( lcalpha / "*" ) *( lcalpha / DIGIT / "_" / "-" / "." / "*" )
+            return (c >= 'a' && c <= 'z') || c == '*';
         }
 
         private static boolean isKeyChar(char c) {
@@ -490,7 +666,13 @@ class SfvParser {
         }
 
         private static boolean isTokenChar(char c) {
-            return isAlpha(c) || isDigit(c) || c == '_' || c == '-' || c == '.' || c == '*' || c == '/';
+            // RFC 9651: token = ( ALPHA / "*" ) *( tchar / ":" / "/" )
+            // tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+            //         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+            return isAlpha(c) || isDigit(c)
+                    || c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\''
+                    || c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_'
+                    || c == '`' || c == '|' || c == '~' || c == ':' || c == '/';
         }
 
         private static boolean isBase64Char(char c) {

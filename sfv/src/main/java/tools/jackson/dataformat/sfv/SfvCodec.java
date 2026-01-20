@@ -46,7 +46,7 @@ final class SfvCodec {
                 throw new IllegalArgumentException("Dictionary entry must be a 2-element array");
             }
             if (!first) {
-                out.append(',');
+                out.append(", ");
             }
             first = false;
             JsonNode keyNode = entryNode.get(0);
@@ -73,7 +73,7 @@ final class SfvCodec {
         boolean first = true;
         for (JsonNode elementNode : node) {
             if (!first) {
-                out.append(',');
+                out.append(", ");
             }
             first = false;
             writeListElement(elementNode, out);
@@ -239,16 +239,14 @@ final class SfvCodec {
     }
 
     private static void writeDecimal(BigDecimal value, StringBuilder out) {
-        BigDecimal normalized = value.stripTrailingZeros();
+        // RFC 9651: Round to 3 decimal places using half-even (banker's rounding)
+        BigDecimal rounded = value.setScale(3, java.math.RoundingMode.HALF_EVEN);
+        BigDecimal normalized = rounded.stripTrailingZeros();
         String text = normalized.toPlainString();
         int dot = text.indexOf('.');
         if (dot < 0) {
             out.append(text).append(".0");
             return;
-        }
-        int fracLen = text.length() - dot - 1;
-        if (fracLen > 3) {
-            throw new IllegalArgumentException("Decimal fraction must have at most 3 digits");
         }
         out.append(text);
     }
@@ -269,8 +267,9 @@ final class SfvCodec {
             throw new IllegalArgumentException("Key cannot be empty");
         }
         char first = key.charAt(0);
-        if (!isLowerAlpha(first)) {
-            throw new IllegalArgumentException("Key must start with lowercase letter");
+        // RFC 9651: key = ( lcalpha / "*" ) *( lcalpha / DIGIT / "_" / "-" / "." / "*" )
+        if (!isLowerAlpha(first) && first != '*') {
+            throw new IllegalArgumentException("Key must start with lowercase letter or asterisk");
         }
         for (int i = 1; i < key.length(); i++) {
             char c = key.charAt(i);
@@ -365,8 +364,13 @@ final class SfvCodec {
     }
 
     private static boolean isTokenChar(char c) {
+        // RFC 9651: token = ( ALPHA / "*" ) *( tchar / ":" / "/" )
+        // tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+        //         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-                || c == '_' || c == '-' || c == '.' || c == '*' || c == '/';
+                || c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\''
+                || c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_'
+                || c == '`' || c == '|' || c == '~' || c == ':' || c == '/';
     }
 
     private static int base32Value(char c) {
